@@ -12,66 +12,102 @@ try {
     $action = $_GET['action'] ?? 'start';
     $batch = (int)($_GET['batch'] ?? 0);
     
-    $dbconn = new mysqli(
-        $_SESSION['server'],
-        $_SESSION['username'],
-        $_SESSION['password'],
-        $_SESSION['db'],
-        $_SESSION['port']
-    );
-    
-    if ($dbconn->connect_errno != 0) {
-        throw new Exception($dbconn->error);
-    }
-    
     switch ($action) {
-        case 'create_db':
-            // Crear base de datos si no existe
-            $db_name = $_SESSION['db'];
-            $dbconn_root = new mysqli(
-                $_SESSION['server'],
-                $_SESSION['username'],
-                $_SESSION['password'],
-                '',
-                $_SESSION['port']
-            );
-            
-            $sql = "CREATE DATABASE IF NOT EXISTS `$db_name` CHARACTER SET=utf8;";
-            $dbconn_root->query($sql);
-            $dbconn_root->close();
+        case 'save_session':
+            // Guardar datos del formulario en sesión
+            $_SESSION['db'] = clean_param($_POST['db'], PARAM_DATA);
+            $_SESSION['data_choice'] = clean_param($_POST['data_choice'], PARAM_ALPHA);
             
             $response['success'] = true;
-            $response['message'] = 'Database created successfully';
-            $response['progress'] = 5;
+            $response['message'] = 'Session data saved';
+            break;
+            
+        case 'check_and_prepare':
+            $dbname = clean_param($_GET['db'], PARAM_DATA);
+            $choice = clean_param($_GET['choice'], PARAM_ALPHA);
+            
+            $_SESSION['db'] = $dbname;
+            
+            $db = new mysqli($_SESSION['server'], $_SESSION['username'], $_SESSION['password'], '', $_SESSION['port']);
+            
+            if ($db->connect_errno != 0) {
+                throw new Exception($db->error);
+            }
+            
+            // Verificar si la BD existe
+            $query = "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME=?";
+            $stmt = $db->prepare($query);
+            $stmt->bind_param('s', $dbname);
+            $stmt->execute();
+            $stmt->bind_result($data);
+            $exists = $stmt->fetch();
+            $stmt->close();
+            
+            if ($exists) {
+                if ($choice == 'newdb') {
+                    throw new Exception('Database exists. Choose "Remove data" option or enter a different name.');
+                }
+                
+                // Purgar la base de datos
+                $db->select_db($dbname);
+                $result = $db->query("SHOW TABLES");
+                
+                while ($row = $result->fetch_row()) {
+                    $db->query("DROP TABLE IF EXISTS `$row[0]`");
+                    $db->query("DROP VIEW IF EXISTS `$row[0]`");
+                }
+                
+                $response['message'] = 'Existing database purged successfully';
+            } else {
+                if ($choice == 'purgedb') {
+                    throw new Exception('Database does not exist. Choose "Create new" option.');
+                }
+                
+                // Crear nueva base de datos
+                $sql = "CREATE DATABASE `$dbname` CHARACTER SET=utf8;";
+                if (!$db->query($sql)) {
+                    throw new Exception($db->error);
+                }
+                
+                $response['message'] = 'New database created successfully';
+            }
+            
+            $db->close();
+            $response['success'] = true;
+            $response['progress'] = 10;
             break;
             
         case 'execute_schema':
-            // Ejecutar schema en batches
             $myFile = "OpensisSchemaMysqlInc.sql";
-            $result = executeSQLInBatches($dbconn, $myFile, $batch);
+            $result = executeSQLInBatches($myFile, $batch);
             
             $response['success'] = true;
             $response['message'] = $result['message'];
-            $response['progress'] = 5 + ($result['progress'] * 0.4); // 5-45%
+            $response['progress'] = $result['progress'];
             $response['complete'] = $result['complete'];
             $response['total_batches'] = $result['total_batches'];
             break;
             
         case 'execute_procs':
-            // Ejecutar procedimientos en batches
             $myFile = "OpensisProcsMysqlInc.sql";
-            $result = executeSQLInBatches($dbconn, $myFile, $batch);
+            $result = executeSQLInBatches($myFile, $batch);
             
             $response['success'] = true;
             $response['message'] = $result['message'];
-            $response['progress'] = 45 + ($result['progress'] * 0.4); // 45-85%
+            $response['progress'] = $result['progress'];
             $response['complete'] = $result['complete'];
             $response['total_batches'] = $result['total_batches'];
             break;
             
         case 'create_triggers':
-            // Crear triggers
+            $dbconn = new mysqli($_SESSION['server'], $_SESSION['username'], $_SESSION['password'], $_SESSION['db'], $_SESSION['port']);
+            
+            if ($dbconn->connect_errno != 0) {
+                throw new Exception($dbconn->error);
+            }
+            
             createUpdatedByTriggers($dbconn);
+            $dbconn->close();
             
             $response['success'] = true;
             $response['message'] = 'Triggers created successfully';
@@ -79,15 +115,11 @@ try {
             break;
             
         case 'finalize':
-            // Finalizar
             $response['success'] = true;
             $response['message'] = 'Database installation complete!';
             $response['progress'] = 100;
-            $response['redirect'] = 'Step3.php';
             break;
     }
-    
-    $dbconn->close();
     
 } catch (Exception $e) {
     $response['success'] = false;
@@ -96,9 +128,15 @@ try {
 
 echo json_encode($response);
 
-function executeSQLInBatches($dbconn, $myFile, $batch) {
+function executeSQLInBatches($myFile, $batch) {
     if (!file_exists($myFile)) {
         throw new Exception("File not found: $myFile");
+    }
+    
+    $dbconn = new mysqli($_SESSION['server'], $_SESSION['username'], $_SESSION['password'], $_SESSION['db'], $_SESSION['port']);
+    
+    if ($dbconn->connect_errno != 0) {
+        throw new Exception($dbconn->error);
     }
     
     $sql = file_get_contents($myFile);
@@ -139,10 +177,12 @@ function executeSQLInBatches($dbconn, $myFile, $batch) {
     // Ejecutar el batch actual
     for ($i = $start; $i < $end; $i++) {
         $result = $dbconn->query($commands[$i]);
-        if (!$result) {
+        if (!$result && $dbconn->errno != 0) {
             error_log("SQL Error: " . $dbconn->error . " | Query: " . substr($commands[$i], 0, 100));
         }
     }
+    
+    $dbconn->close();
     
     $progress = ($end / $total) * 100;
     $complete = ($end >= $total);
